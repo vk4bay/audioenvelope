@@ -2,31 +2,52 @@ import sys
 import os
 import time
 import queue
+import platform
 import ctypes
-import ctypes.wintypes
 import numpy as np
 import sounddevice as sd
 import dearpygui.dearpygui as dpg
 
+# Optional scipy: gives a C-level biquad implementation that does not hold
+# the Python GIL inside the audio callback, eliminating a major stutter source
+# on Linux/macOS.  Gracefully falls back to the pure-Python loop if absent.
+try:
+    from scipy.signal import sosfilt as _sosfilt
+    _HAVE_SCIPY = True
+except ImportError:
+    _HAVE_SCIPY = False
+
 # Folder that contains this script — used to locate assets (logo, font)
 # regardless of which directory Python is launched from.
-_HERE = os.path.dirname(os.path.abspath(__file__))
+# When frozen by PyInstaller (--onefile), files are unpacked to sys._MEIPASS.
+if getattr(sys, 'frozen', False):
+    _HERE = sys._MEIPASS          # PyInstaller bundle unpacks here at runtime
+else:
+    _HERE = os.path.dirname(os.path.abspath(__file__))
 
-# ── Windows API constants for monitor-aware fullscreen ──────────────────────
-_GWL_STYLE           = -16
-_WS_OVERLAPPEDWINDOW = 0x00CF0000
-_WS_POPUP            = 0x80000000
-_SWP_FRAMECHANGED    = 0x0020
-_SWP_SHOWWINDOW      = 0x0040
-_MONITOR_NEAREST     = 0x00000002
+# ── Application identity ────────────────────────────────────────────────────
+APP_TITLE = "Real-Time Oscilloscope V7"   # single definition used everywhere
 
-class _MONITORINFO(ctypes.Structure):
-    _fields_ = [
-        ("cbSize",    ctypes.wintypes.DWORD),
-        ("rcMonitor", ctypes.wintypes.RECT),
-        ("rcWork",    ctypes.wintypes.RECT),
-        ("dwFlags",   ctypes.wintypes.DWORD),
-    ]
+# ── Windows-only: monitor-aware borderless fullscreen via Win32 API ──────────
+_IS_WINDOWS = platform.system() == 'Windows'
+
+if _IS_WINDOWS:
+    import ctypes.wintypes
+
+    _GWL_STYLE           = -16
+    _WS_OVERLAPPEDWINDOW = 0x00CF0000
+    _WS_POPUP            = 0x80000000
+    _SWP_FRAMECHANGED    = 0x0020
+    _SWP_SHOWWINDOW      = 0x0040
+    _MONITOR_NEAREST     = 0x00000002
+
+    class _MONITORINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize",    ctypes.wintypes.DWORD),
+            ("rcMonitor", ctypes.wintypes.RECT),
+            ("rcWork",    ctypes.wintypes.RECT),
+            ("dwFlags",   ctypes.wintypes.DWORD),
+        ]
 
 # Seconds of audio held in the pitch-shift ring buffer.
 PITCH_BUF_SECS = 4.0
@@ -49,10 +70,10 @@ SPEC_DB_MAX   =  20.0                       # dB ceiling (maps to colour 1)
 
 class AudioOscilloscopeDPG:
     def __init__(self):
-        print("Initializing Audio System (V5 - Effects Edition)...")
+        print("Initializing Audio System (V7 - Effects Edition)...")
         self.stream = None
         self.is_running = False
-        self.input_gain = 10.0    # 1000 % default
+        self.input_gain = 500.0   # 100 % on the 0-100 slider = slider × 5 = 500× gain
         self.output_gain = 0.0    # 0 % default -- no speaker feedback at start
 
         # --- Oscilloscope ring buffer ---
@@ -132,8 +153,33 @@ class AudioOscilloscopeDPG:
         # =================================================================
         self._hpf_cutoff = 80.0          # Hz — cached for change detection
         self._hpf_coeffs = None          # (b0,b1,b2,a1,a2) normalised by a0
+        self._hpf_sos    = None          # shape (1,6) SOS matrix for sosfilt (scipy)
         self._hpf_z1     = 0.0           # biquad delay element 1
         self._hpf_z2     = 0.0           # biquad delay element 2
+
+        # Pre-allocated index array reused by delay/robot effects inside the
+        # audio callback — avoids 7× np.arange heap allocations per callback.
+        self._frame_indices = np.arange(128, dtype=np.intp)
+
+        # Detect once whether DPG set_value accepts a numpy array directly
+        # (avoids 15–25 ms ravel().tolist() GIL hold every texture upload).
+        self._dpg_tex_as_array = None   # None = not yet detected
+
+        # ----------------------------------------------------------------
+        # Cached slider values for safe access from the audio C-thread.
+        # dpg.get_value() grabs the Python GIL; calling it from PortAudio's
+        # real-time thread causes priority inversion / stutters on Linux.
+        # These are refreshed each render frame on the main thread instead.
+        # ----------------------------------------------------------------
+        self._cached_echo_delay    = 300.0
+        self._cached_echo_feedback = 0.40
+        self._cached_robot_freq    = 100.0
+        self._cached_deep_pitch    = 0.45
+        self._cached_delay_time    = 0.0
+
+        # Limit spectrograph texture uploads to ≤30 fps to avoid spending
+        # tens of milliseconds on .tolist() every render frame.
+        self._spec_last_upload = 0.0
 
         # Fetch audio devices
         self.devices = sd.query_devices()
@@ -191,18 +237,17 @@ class AudioOscilloscopeDPG:
         buf = self.delay_buf
         buf_size = len(buf)
 
-        delay_ms = float(dpg.get_value("fx_echo_delay")) if dpg.does_item_exist("fx_echo_delay") else 300.0
-        feedback = float(dpg.get_value("fx_echo_feedback")) if dpg.does_item_exist("fx_echo_feedback") else 0.45
-        feedback = min(feedback, 0.90)
+        delay_ms = self._cached_echo_delay
+        feedback = min(self._cached_echo_feedback, 0.90)
 
         delay_samps = max(1, int(delay_ms * self.stream_samplerate / 1000.0))
         delay_samps = min(delay_samps, buf_size - frames - 1)
 
-        rpos = (self.delay_write_pos - delay_samps + np.arange(frames)) % buf_size
+        rpos = (self.delay_write_pos - delay_samps + self._frame_indices[:frames]) % buf_size
         delayed = buf[rpos]
         output = signal + delayed * feedback
 
-        wpos = (self.delay_write_pos + np.arange(frames)) % buf_size
+        wpos = (self.delay_write_pos + self._frame_indices[:frames]) % buf_size
         buf[wpos] = output
         self.delay_write_pos = (self.delay_write_pos + frames) % buf_size
 
@@ -211,11 +256,11 @@ class AudioOscilloscopeDPG:
     def _apply_pure_delay(self, signal):
         frames = len(signal)
 
-        delay_sec = float(dpg.get_value("fx_delay_time")) if dpg.does_item_exist("fx_delay_time") else 0.0
+        delay_sec = self._cached_delay_time
         if delay_sec <= 0.0:
             buf = self.delay_buf2
             buf_size = len(buf)
-            wpos = (self.delay_write_pos2 + np.arange(frames)) % buf_size
+            wpos = (self.delay_write_pos2 + self._frame_indices[:frames]) % buf_size
             buf[wpos] = signal
             self.delay_write_pos2 = (self.delay_write_pos2 + frames) % buf_size
             return signal
@@ -225,10 +270,10 @@ class AudioOscilloscopeDPG:
         delay_samps = min(int(delay_sec * self.stream_samplerate), buf_size - frames - 1)
         delay_samps = max(1, delay_samps)
 
-        rpos = (self.delay_write_pos2 - delay_samps + np.arange(frames)) % buf_size
+        rpos = (self.delay_write_pos2 - delay_samps + self._frame_indices[:frames]) % buf_size
         delayed = buf[rpos]
 
-        wpos = (self.delay_write_pos2 + np.arange(frames)) % buf_size
+        wpos = (self.delay_write_pos2 + self._frame_indices[:frames]) % buf_size
         buf[wpos] = signal
         self.delay_write_pos2 = (self.delay_write_pos2 + frames) % buf_size
 
@@ -236,9 +281,9 @@ class AudioOscilloscopeDPG:
 
     def _apply_robot(self, signal):
         frames = len(signal)
-        freq = float(dpg.get_value("fx_robot_freq")) if dpg.does_item_exist("fx_robot_freq") else 100.0
+        freq = self._cached_robot_freq
 
-        t = np.arange(frames, dtype=np.float64) / self.stream_samplerate
+        t = self._frame_indices[:frames].astype(np.float64) / self.stream_samplerate
         phase_inc = 2.0 * np.pi * freq * frames / self.stream_samplerate
 
         carrier1 = np.sign(np.sin(2.0 * np.pi * freq * t + self.robot_phase)).astype(np.float32)
@@ -251,10 +296,10 @@ class AudioOscilloscopeDPG:
             buf  = self.robot_comb_buf
             BUF  = len(buf)
             comb_d = min(max(1, int(self.stream_samplerate / freq)), BUF - frames - 1)
-            rpos   = (self.robot_comb_pos - comb_d + np.arange(frames)) % BUF
+            rpos   = (self.robot_comb_pos - comb_d + self._frame_indices[:frames]) % BUF
             delayed = buf[rpos]
             combed  = modulated + 0.55 * delayed
-            wpos    = (self.robot_comb_pos + np.arange(frames)) % BUF
+            wpos    = (self.robot_comb_pos + self._frame_indices[:frames]) % BUF
             buf[wpos] = combed
             self.robot_comb_pos = (self.robot_comb_pos + frames) % BUF
         else:
@@ -291,18 +336,31 @@ class AudioOscilloscopeDPG:
 
         # Store normalised coefficients (divide through by a0)
         self._hpf_coeffs = (b0/a0, b1/a0, b2/a0, a1/a0, a2/a0)
+        # Pre-build SOS matrix [b0,b1,b2,1,a1,a2] for scipy sosfilt
+        self._hpf_sos    = np.array([[b0/a0, b1/a0, b2/a0, 1.0, a1/a0, a2/a0]],
+                                     dtype=np.float64)
         self._hpf_cutoff = cutoff_hz
         self._hpf_z1     = 0.0
         self._hpf_z2     = 0.0
 
     def _apply_hpf(self, signal):
         """
-        Filter `signal` through the cached biquad using transposed Direct Form II.
-        Operates sample-by-sample (block size is typically only 128 samples so
-        the Python loop overhead is negligible).
+        Filter `signal` through the cached biquad.
+        Uses scipy sosfilt (C-level, no GIL in audio callback) when available,
+        otherwise falls back to a pure-Python transposed Direct Form II loop.
         """
         if self._hpf_coeffs is None:
             return signal
+
+        if _HAVE_SCIPY and self._hpf_sos is not None:
+            # sosfilt state: shape (n_sections=1, 2)
+            zi = np.array([[self._hpf_z1, self._hpf_z2]], dtype=np.float64)
+            out, zf = _sosfilt(self._hpf_sos, signal.astype(np.float64), zi=zi)
+            self._hpf_z1 = float(zf[0, 0])
+            self._hpf_z2 = float(zf[0, 1])
+            return out.astype(np.float32)
+
+        # Pure-Python fallback (no scipy)
         b0, b1, b2, a1, a2 = self._hpf_coeffs
         n   = len(signal)
         out = np.empty(n, dtype=np.float32)
@@ -332,8 +390,7 @@ class AudioOscilloscopeDPG:
         if mode == 1:
             fx_out = self._apply_pitch_shift(processed_in, 2.0)
         elif mode == 2:
-            deep_factor = float(dpg.get_value("fx_deep_pitch")) if dpg.does_item_exist("fx_deep_pitch") else 0.45
-            fx_out = self._apply_pitch_shift(processed_in, deep_factor)
+            fx_out = self._apply_pitch_shift(processed_in, self._cached_deep_pitch)
         elif mode == 3:
             fx_out = self._apply_echo(processed_in)
         elif mode == 4:
@@ -415,7 +472,12 @@ class AudioOscilloscopeDPG:
             self._build_hpf_coeffs(hpf_cutoff)
 
             try:
-                self.active_blocksize = 128
+                # Linux ALSA needs a larger blocksize to tolerate Python GIL
+                # pauses; Windows WASAPI is fine at 128.
+                self.active_blocksize = 512 if platform.system() == 'Linux' else 128
+                # Pre-allocate frame-index array used inside the audio callback
+                # to avoid 7× np.arange() heap allocations per invocation.
+                self._frame_indices = np.arange(self.active_blocksize, dtype=np.intp)
                 self.stream = sd.Stream(
                     device=(in_idx, out_idx),
                     samplerate=sync_samplerate,
@@ -430,7 +492,8 @@ class AudioOscilloscopeDPG:
                 print(f"Audio Error: {e}")
 
     def update_gains(self):
-        self.input_gain = dpg.get_value("in_gain_slider") / 100.0
+        # Slider 0–100; value × 5 is supplied as gain (max 500× at 100 %).
+        self.input_gain  = dpg.get_value("in_gain_slider") * 5.0
         self.output_gain = dpg.get_value("out_gain_slider") / 100.0
 
     _FX_LABELS = ["Normal", "Chipmunk", "Voice Pitch", "Echo", "Robot"]
@@ -455,10 +518,17 @@ class AudioOscilloscopeDPG:
             dpg.set_item_label(tag, prefix + self._FX_LABELS[i])
 
     def toggle_fullscreen(self):
+        if not _IS_WINDOWS:
+            # Linux / macOS: DearPyGui's built-in viewport fullscreen
+            self._is_fullscreen = not self._is_fullscreen
+            dpg.toggle_viewport_fullscreen()
+            return
+
+        # Windows: Win32 API for true monitor-aware borderless fullscreen
         u32 = ctypes.windll.user32
 
         if not self._is_fullscreen:
-            hwnd = u32.FindWindowW(None, "Real-Time Oscilloscope V5")
+            hwnd = u32.FindWindowW(None, APP_TITLE)
             if not hwnd:
                 return
 
@@ -489,6 +559,11 @@ class AudioOscilloscopeDPG:
                              l, t, r2 - l, b - t,
                              _SWP_FRAMECHANGED | _SWP_SHOWWINDOW)
             self._is_fullscreen = False
+
+    def _on_escape_key(self, sender, app_data, user_data):
+        """Exit fullscreen when Escape is pressed."""
+        if self._is_fullscreen:
+            self.toggle_fullscreen()
 
     def _toggle_display_mode(self, sender, app_data, user_data):
         """Switch between oscilloscope and spectrograph panels."""
@@ -588,7 +663,13 @@ class AudioOscilloscopeDPG:
                     mag = spectrum[i0] * (1.0 - fr) + spectrum[i1] * fr
 
                     # --- dB with floor ---
-                    db = 20.0 * np.log10(mag + 1e-9)
+                    # spec_gain_db shifts the colour scale independently of mic level.
+                    # A fixed -20 dB is applied unconditionally so that the slider's
+                    # -40 dB stop gives an effective -60 dB reference, making the
+                    # spectrograph match the oscilloscope amplitude levels.
+                    spec_gain_db = float(dpg.get_value("spec_gain_db")) \
+                        if dpg.does_item_exist("spec_gain_db") else -20.0
+                    db = 20.0 * np.log10(mag + 1e-9) + spec_gain_db - 20.0
                     norm = np.clip((db - SPEC_DB_MIN) / (SPEC_DB_MAX - SPEC_DB_MIN),
                                    0.0, 1.0).astype(np.float32)
 
@@ -610,10 +691,26 @@ class AudioOscilloscopeDPG:
                         self._spec_accum[SPEC_HOP:SPEC_FFT_SIZE]
                     self._spec_accum_n = SPEC_FFT_SIZE - SPEC_HOP
 
-        # Upload texture to GPU only when new rows were computed
+        # Upload texture to GPU only when new rows were computed, capped at ~30 fps.
+        # ravel().tolist() on a 400×1024×4 array takes ~20 ms — too expensive every frame.
         if new_rows > 0 and dpg.does_item_exist("spec_texture"):
-            self._spec_flat = self._spec_tex.ravel().tolist()
-            dpg.set_value("spec_texture", self._spec_flat)
+            _upload_now = time.perf_counter()
+            if _upload_now - self._spec_last_upload >= 0.033:   # ≤30 fps
+                flat = self._spec_tex.ravel()
+                # Detect once whether DPG accepts a numpy array directly.
+                # If so we skip the 15–25 ms ravel().tolist() GIL hold entirely.
+                if self._dpg_tex_as_array is None:
+                    try:
+                        dpg.set_value("spec_texture", flat)
+                        self._dpg_tex_as_array = True
+                    except Exception:
+                        self._dpg_tex_as_array = False
+                if self._dpg_tex_as_array:
+                    dpg.set_value("spec_texture", flat)
+                else:
+                    self._spec_flat = flat.tolist()
+                    dpg.set_value("spec_texture", self._spec_flat)
+                self._spec_last_upload = _upload_now
 
     # =================================================================
     # RENDER LOOP
@@ -630,6 +727,18 @@ class AudioOscilloscopeDPG:
             _hpf_val = float(dpg.get_value("hpf_cutoff"))
             if abs(_hpf_val - self._hpf_cutoff) > 0.5:
                 self._build_hpf_coeffs(_hpf_val)
+
+        # Refresh cached slider values so the audio C-thread never calls dpg.get_value()
+        if dpg.does_item_exist("fx_echo_delay"):
+            self._cached_echo_delay    = float(dpg.get_value("fx_echo_delay"))
+        if dpg.does_item_exist("fx_echo_feedback"):
+            self._cached_echo_feedback = float(dpg.get_value("fx_echo_feedback"))
+        if dpg.does_item_exist("fx_robot_freq"):
+            self._cached_robot_freq    = float(dpg.get_value("fx_robot_freq"))
+        if dpg.does_item_exist("fx_deep_pitch"):
+            self._cached_deep_pitch    = float(dpg.get_value("fx_deep_pitch"))
+        if dpg.does_item_exist("fx_delay_time"):
+            self._cached_delay_time    = float(dpg.get_value("fx_delay_time"))
 
         # Drain the audio queue — shared by both display modes
         chunks = []
@@ -715,9 +824,9 @@ class AudioOscilloscopeDPG:
     # =================================================================
 
     def build_gui(self):
-        print("Building GUI context (V5 - Effects Edition)...")
+        print("Building GUI context (V7 - Effects Edition)...")
         dpg.create_context()
-        dpg.create_viewport(title='Real-Time Oscilloscope V5', width=1400, height=900)
+        dpg.create_viewport(title=APP_TITLE, width=1400, height=900)
         dpg.setup_dearpygui()
 
         with dpg.font_registry():
@@ -754,7 +863,7 @@ class AudioOscilloscopeDPG:
             dpg.add_dynamic_texture(SPEC_TEX_W, SPEC_TEX_H, _spec_init,
                                     tag="spec_texture")
 
-        with dpg.window(label="Oscilloscope V5", tag="Primary Window"):
+        with dpg.window(label="Oscilloscope V7", tag="Primary Window"):
 
             # ---- Shared control theme ----------------------------------------
             with dpg.theme() as standout_theme:
@@ -841,12 +950,13 @@ class AudioOscilloscopeDPG:
                     with dpg.group(horizontal=True):
                         dpg.add_text("Mic Level (%):")
                         dpg.add_slider_float(label="##in_gain", tag="in_gain_slider",
-                                             default_value=1000.0, max_value=20000.0,
+                                             default_value=100.0, min_value=0.0,
+                                             max_value=100.0,
                                              callback=self.update_gains, width=180)
                         dpg.add_spacer(width=8)
                         dpg.add_text("Output Volume (%):")
                         dpg.add_slider_float(label="##out_gain", tag="out_gain_slider",
-                                             default_value=0.0, max_value=200.0,
+                                             default_value=0.0, max_value=100.0,
                                              callback=self.update_gains, width=140)
                     with dpg.group(horizontal=True):
                         dpg.add_text("Out Delay (s):")
@@ -950,7 +1060,7 @@ class AudioOscilloscopeDPG:
             # =================================================================
             with dpg.group(tag="spec_panel", show=False):
 
-                # Controls row: freq zoom + persistence
+                # Controls row: freq zoom + persistence + independent gain
                 with dpg.group(horizontal=True):
                     dpg.add_text("Freq Min (Hz):")
                     dpg.add_slider_float(label="##spec_fmin", tag="spec_freq_min",
@@ -967,7 +1077,12 @@ class AudioOscilloscopeDPG:
                     dpg.add_text("Persistence:")
                     dpg.add_slider_float(label="##spec_persist", tag="spec_persist",
                                          default_value=0.85, min_value=0.0,
-                                         max_value=1.0, width=160)
+                                         max_value=1.0, width=120)
+                    dpg.add_spacer(width=14)
+                    dpg.add_text("Spec Gain (dB):")
+                    dpg.add_slider_float(label="##spec_gain_db", tag="spec_gain_db",
+                                         default_value=-20.0, min_value=-40.0,
+                                         max_value=60.0, width=140)
 
                 dpg.add_spacer(height=6)
 
@@ -1012,6 +1127,11 @@ class AudioOscilloscopeDPG:
                               width=self._logo_w, height=self._logo_h)
 
         dpg.show_viewport()
+
+        # Register global keyboard handler — Escape cancels fullscreen
+        with dpg.handler_registry():
+            dpg.add_key_release_handler(dpg.mvKey_Escape,
+                                        callback=self._on_escape_key)
 
         # Build initial freq axis (default full range, sr 44100)
         self._build_spec_freq_axis(20.0, 20000.0)

@@ -1,0 +1,9 @@
+# Build-time dependencies (Windows only — produces the installer .exe)
+# Install with:  pip install -r requirements-build.txt
+#
+# Also requires Inno Setup 6 (free): https://jrsoftware.org/isdl.php
+# Default install path expected by build.ps1:
+#   C:\Program Files (x86)\Inno Setup 6\ISCC.exe
+
+pyinstaller>=6.0.0
+

@@ -1,0 +1,15 @@
+# Runtime dependencies for AudioEnvelope (main.py)
+# Install with:  pip install -r requirements.txt
+#
+# Tested with Python 3.12.  Python 3.11+ should also work.
+
+dearpygui>=2.3.1
+numpy>=1.26.4
+sounddevice>=0.5.1
+psutil>=5.9.0
+
+# Optional but strongly recommended on Linux/macOS:
+# Provides a C-level biquad filter that eliminates GIL-induced audio stutters.
+# The app falls back to a pure-Python loop if scipy is not installed.
+scipy>=1.10.0
+
