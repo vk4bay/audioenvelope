@@ -8,8 +8,8 @@ numpy>=1.26.4
 sounddevice>=0.5.1
 psutil>=5.9.0
 
-# Optional but strongly recommended on Linux/macOS:
-# Provides a C-level biquad filter that eliminates GIL-induced audio stutters.
-# The app falls back to a pure-Python loop if scipy is not installed.
-scipy>=1.10.0
+# scipy is NOT required on Windows — the app uses a pure-Python biquad fallback.
+# On Linux/macOS scipy provides a C-level sosfilt that avoids GIL-induced stutters;
+# install it manually there if needed:  pip install "scipy>=1.10.0"
+# scipy>=1.10.0
 
