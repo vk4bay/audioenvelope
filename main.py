@@ -27,7 +27,7 @@ else:
 
 # ── Application identity ────────────────────────────────────────────────────
 # Version string: bump the minor number with every released change.
-APP_VERSION = "7.11"                    # bump minor on each change
+APP_VERSION = "7.12"                    # bump minor on each change
 APP_TITLE   = f"Real-Time Oscilloscope V{APP_VERSION}"   # single definition used everywhere
 
 # ── Windows-only: monitor-aware borderless fullscreen via Win32 API ──────────
@@ -55,10 +55,11 @@ if _IS_WINDOWS:
 PITCH_BUF_SECS = 4.0
 
 # Q factor of the notch filter applied to the ROBOT effect's output.  The
-# robot voice is built from a 100 Hz square-wave carrier whose fundamental
-# leaks through as a constant hum whenever the microphone picks up noise/DC;
-# the notch cancels the carrier line wide enough to suppress it solidly
-# while leaving the voice sidebands on either side intact.
+# robot voice is built from a square-wave carrier at ROBOT_FREQ_DEFAULT whose
+# fundamental leaks through as a constant hum whenever the microphone picks
+# up noise/DC; the notch cancels whichever carrier line is selected by the
+# Robot Freq slider, wide enough to suppress it solidly while leaving the
+# voice sidebands on either side intact.
 ROBOT_NOTCH_Q = 5.0
 
 # =============================================================================
@@ -129,6 +130,9 @@ OUT_GAIN_SLIDER_DEFAULT = 5.0
 # Robot modulation frequency at startup, Hz (slider default + notch tuning).
 ROBOT_FREQ_DEFAULT = 67.5
 
+# Voice Pitch effect default (×) — slider default and initial effect setting.
+DEEP_PITCH_DEFAULT = 1.3
+
 
 class AudioOscilloscopeDPG:
     def __init__(self):
@@ -194,9 +198,9 @@ class AudioOscilloscopeDPG:
         self.robot_comb_buf = np.zeros(0, dtype=np.float32)
         self.robot_comb_pos = 0
 
-        # Notch filter applied to the Robot effect output (cancels the
-        # 100 Hz modulation carrier hum).  Coefficients rebuilt whenever the
-        # Robot Freq slider moves, exactly like the two HPFs.
+# Notch filter applied to the Robot effect output (cancels the modulation
+# carrier hum at the current Robot Freq).  Coefficients rebuilt whenever the
+# Robot Freq slider moves, exactly like the two HPFs.
         self._notch_coeffs = None          # (b0,b1,b2,a1,a2) normalised by a0
         self._notch_sos    = None          # shape (1,6) SOS matrix for sosfilt
         self._notch_freq   = None          # Hz it was last built for
@@ -270,7 +274,7 @@ class AudioOscilloscopeDPG:
         self._cached_echo_delay    = 300.0
         self._cached_echo_feedback = 0.40
         self._cached_robot_freq    = ROBOT_FREQ_DEFAULT
-        self._cached_deep_pitch    = 0.45
+        self._cached_deep_pitch    = DEEP_PITCH_DEFAULT
         self._cached_delay_time    = 0.0
 
         # Limit spectrograph texture uploads to ≤30 fps to avoid spending
@@ -418,11 +422,11 @@ class AudioOscilloscopeDPG:
         else:
             combed = modulated
 
-        # Re-mix the voice back in AFTER the ring: 60 % machine ring + 25 % clean
-        # crushed speech + 28 % untouched dry voice.  The speech stays thick and
+        # Re-mix the voice back in AFTER the ring: 47 % machine ring + 28 % crushed
+        # speech + 31 % untouched dry voice.  The speech stays thick and
         # understandable ("EXTERMINATE!" lands) while the carrier and its comb
         # sustain still drive the Daleky drone underneath.
-        voice = crushed * 0.25 + signal * 0.28
+        voice = crushed * 0.28 + signal * 0.31
         core  = combed * 0.47 + voice
 
         core = np.tanh(core * 1.8).astype(np.float32) * 0.65
@@ -1385,7 +1389,7 @@ class AudioOscilloscopeDPG:
             with dpg.group(horizontal=True):
                 dpg.add_text("Voice Pitch:")
                 dpg.add_slider_float(label="##deep_pitch", tag="fx_deep_pitch",
-                                     default_value=0.45, min_value=0.25, max_value=4.0, width=200)
+                                     default_value=DEEP_PITCH_DEFAULT, min_value=0.25, max_value=4.0, width=200)
                 dpg.add_spacer(width=14)
                 dpg.add_text("Echo Delay (ms):")
                 dpg.add_slider_float(label="##echo_delay", tag="fx_echo_delay",
