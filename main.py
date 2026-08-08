@@ -26,7 +26,9 @@ else:
     _HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ── Application identity ────────────────────────────────────────────────────
-APP_TITLE = "Real-Time Oscilloscope V7"   # single definition used everywhere
+# Version string: bump the minor number with every released change.
+APP_VERSION = "7.8"                     # bump minor on each change
+APP_TITLE   = f"Real-Time Oscilloscope V{APP_VERSION}"   # single definition used everywhere
 
 # ── Windows-only: monitor-aware borderless fullscreen via Win32 API ──────────
 _IS_WINDOWS = platform.system() == 'Windows'
@@ -59,8 +61,45 @@ PITCH_BUF_SECS = 4.0
 # Hop is half the window (50 % overlap) for smooth temporal resolution.
 SPEC_FFT_SIZE = 4096
 SPEC_HOP      = SPEC_FFT_SIZE // 2          # 2048 samples ≈ 46 ms per row
-SPEC_TEX_W    = 1024                        # texture pixel columns (frequency axis)
+SPEC_TEX_W    = 512                         # texture pixel columns (frequency axis)
 SPEC_TEX_H    = 400                         # texture pixel rows    (time axis, history)
+
+# Never push more than this many points to the waveform plots per frame.
+# Larger buffers are decimated to min/max envelopes (peaks are preserved),
+# which keeps the per-frame set_value() work and GPU draw bounded.
+# The trace is also split into 4 amplitude-zoned series (each ≤ this cap),
+# so the cap is set lower than before to keep the combined upload roughly
+# unchanged — 20k points is ~14 envelope pairs per pixel at 1400 px.
+DISPLAY_MAX_POINTS = 20000
+
+# Amplitude zones that colour the trace: the wave is split by |amp| into
+# blue / green / amber / red bands, plus a smooth level colour for the
+# phosphor shade driven by a fast-attack/slow-release envelope follower.
+ZONE_EDGES = (0.0, 0.12, 0.25, 0.38, np.inf)
+ZONE_COLS  = [
+    ( 60, 140, 255),   # blue   — quiet
+    (  0, 220,  90),   # green  — mid
+    (255, 200,  40),   # amber  — loud
+    (255,  50,  50),   # red    — hot
+]
+SHADE_ALPHA = 60
+# Colour-change lag: the shade band must persist for this many FRAMES before
+# the colour is allowed to move, keeping the tint stable between peaks.  The
+# final lag is scaled to the timebase (see SHADE_BAND_HOLD_SCREEN below): on a
+# slow sweep the trace moves across the screen too quickly for a fixed-frame
+# count to stabilise, so this value acts as the minimum hold, not the exact one.
+SHADE_BAND_HOLD_FRAMES = 20
+# The colour-hold lag for a given timebase is "this fraction of the screen
+# width as song-time" — i.e. the shade cannot change colour until the trace
+# has swept this far across the display.  (0.05 = 5 % of the sweep.)
+# Slow timebases therefore get long holds, fast ones short holds.
+# Gaps below render roughly every ~60 fps.  Also used as the length of the
+# trailing amplitude window that KEYs the trace colour at every position.
+SHADE_BAND_HOLD_SCREEN = 0.05
+# Frames over which a committed colour change is eased (glide) into place.
+SHADE_BAND_EASE_FRAMES = 6
+# Render-loop tick rate used to convert the screen-width hold into frames.
+SHADE_TICK_RATE       = 60.0
 SPEC_DB_MIN   = -80.0                       # dB floor  (maps to colour 0)
 SPEC_DB_MAX   =  20.0                       # dB ceiling (maps to colour 1)
                                             # +20 dB headroom above 0 dBFS gives
@@ -91,6 +130,16 @@ class AudioOscilloscopeDPG:
         self.last_visible_points = -1
         self.x_data_cache = None
         self.zero_line_cache = None
+
+        # Smoothed amplitude envelope (fast attack / slow release) driving
+        # the phosphor shade colour — see update_render_loop.
+        self._env_level = 0.0
+        # Colour band with a hold lag (see SHADE_BAND_HOLD_FRAMES) so the tint
+        # stays constant between peaks instead of flickering at band edges.
+        self._shade_band = 0
+        self._shade_band_hold = 0
+        self._shade_color_cur = ZONE_COLS[0]
+        self._shade_color_dst = ZONE_COLS[0]
 
         self.audio_queue = queue.Queue(maxsize=100)
 
@@ -180,6 +229,16 @@ class AudioOscilloscopeDPG:
         # Limit spectrograph texture uploads to ≤30 fps to avoid spending
         # tens of milliseconds on .tolist() every render frame.
         self._spec_last_upload = 0.0
+
+        # Cached values of the persistence / gain sliders (read once per
+        # frame instead of once per FFT row inside the spectrograph loop).
+        self._spec_persist  = 0.85
+        self._spec_gain_db  = -20.0
+        # Cache for "does this item exist" (snapshotted at GUI build time).
+        self._item_flags    = {}
+        # Change-detection keys for the per-frame spectrograph layout work.
+        self._spec_draw_dim = (0, 0)
+        self._spec_label_key = None
 
         # Fetch audio devices
         self.devices = sd.query_devices()
@@ -492,8 +551,11 @@ class AudioOscilloscopeDPG:
                 print(f"Audio Error: {e}")
 
     def update_gains(self):
-        # Slider 0–100; value × 5 is supplied as gain (max 500× at 100 %).
-        self.input_gain  = dpg.get_value("in_gain_slider") * 5.0
+        # Input gain uses an exponential (log) scale so the low end stays
+        # usable: slider 100 → 50×, 50 → ~1.6×, 25 → ~0.28×, 0 → 0.05×.
+        # A linear scale was far too hot — a few percent already clipped.
+        _t = float(dpg.get_value("in_gain_slider")) / 100.0
+        self.input_gain  = 0.05 * (1000.0 ** _t)
         self.output_gain = dpg.get_value("out_gain_slider") / 100.0
 
     _FX_LABELS = ["Normal", "Chipmunk", "Voice Pitch", "Echo", "Robot"]
@@ -630,7 +692,7 @@ class AudioOscilloscopeDPG:
             self._build_spec_freq_axis(20.0, 20000.0)
 
         # Read persistence blend factor from slider (0=full trails, 1=no trails)
-        persist = float(dpg.get_value("spec_persist")) if dpg.does_item_exist("spec_persist") else 0.85
+        persist = self._spec_persist
 
         new_rows = 0
 
@@ -667,8 +729,7 @@ class AudioOscilloscopeDPG:
                     # A fixed -20 dB is applied unconditionally so that the slider's
                     # -40 dB stop gives an effective -60 dB reference, making the
                     # spectrograph match the oscilloscope amplitude levels.
-                    spec_gain_db = float(dpg.get_value("spec_gain_db")) \
-                        if dpg.does_item_exist("spec_gain_db") else -20.0
+                    spec_gain_db = self._spec_gain_db
                     db = 20.0 * np.log10(mag + 1e-9) + spec_gain_db - 20.0
                     norm = np.clip((db - SPEC_DB_MIN) / (SPEC_DB_MAX - SPEC_DB_MIN),
                                    0.0, 1.0).astype(np.float32)
@@ -692,8 +753,8 @@ class AudioOscilloscopeDPG:
                     self._spec_accum_n = SPEC_FFT_SIZE - SPEC_HOP
 
         # Upload texture to GPU only when new rows were computed, capped at ~30 fps.
-        # ravel().tolist() on a 400×1024×4 array takes ~20 ms — too expensive every frame.
-        if new_rows > 0 and dpg.does_item_exist("spec_texture"):
+        # ravel().tolist() on a 400×512×4 array takes ~10 ms — too expensive every frame.
+        if new_rows > 0 and self._item_flags.get("spec_texture", True):
             _upload_now = time.perf_counter()
             if _upload_now - self._spec_last_upload >= 0.033:   # ≤30 fps
                 flat = self._spec_tex.ravel()
@@ -716,6 +777,38 @@ class AudioOscilloscopeDPG:
     # RENDER LOOP
     # =================================================================
 
+    @staticmethod
+    def _decimate_for_display(y, cap=DISPLAY_MAX_POINTS):
+        """
+        Min/max envelope decimation so the plot never receives more than
+        `cap` points per frame, regardless of the Timebase slider value.
+        A 450000-point frame becomes ~50000 points (22500 min/max pairs),
+        which preserves the waveform outline — and every peak — while
+        cutting set_value() cost by ~9×.
+        Returns a new float32 array of length ≤ 2·(n//step).
+        """
+        n = y.size
+        if n <= cap:
+            return y
+        step = max(2, n // (cap // 2))        # samples per (min, max) pair
+        k    = n // step
+        yc   = y[: k * step].reshape(k, step)
+        out  = np.empty(2 * k, dtype=y.dtype)
+        out[0::2] = yc.min(axis=1)
+        out[1::2] = yc.max(axis=1)
+        return out
+
+    def _snapshot_item_flags(self):
+        """Snapshot item-existence once so the render loop never calls
+        dpg.does_item_exist() (a binder lookup each time) per frame."""
+        for tag in ("hpf_cutoff", "fx_echo_delay", "fx_echo_feedback",
+                    "fx_robot_freq", "fx_deep_pitch", "fx_delay_time",
+                    "speed_slider", "spec_persist", "spec_gain_db",
+                    "spec_freq_min", "spec_freq_max", "spec_texture",
+                    "spec_waterfall_win", "spec_drawlist", "spec_draw_img",
+                    "spec_freq_drawlist", "disp_mode_btn", "start_btn"):
+            self._item_flags[tag] = dpg.does_item_exist(tag)
+
     def update_render_loop(self):
         if not self.is_running:
             return
@@ -723,21 +816,21 @@ class AudioOscilloscopeDPG:
         now = time.perf_counter()
 
         # Re-build HPF if the cutoff slider was moved (main-thread safe)
-        if dpg.does_item_exist("hpf_cutoff"):
+        if self._item_flags.get("hpf_cutoff", True):
             _hpf_val = float(dpg.get_value("hpf_cutoff"))
             if abs(_hpf_val - self._hpf_cutoff) > 0.5:
                 self._build_hpf_coeffs(_hpf_val)
 
         # Refresh cached slider values so the audio C-thread never calls dpg.get_value()
-        if dpg.does_item_exist("fx_echo_delay"):
+        if self._item_flags.get("fx_echo_delay", True):
             self._cached_echo_delay    = float(dpg.get_value("fx_echo_delay"))
-        if dpg.does_item_exist("fx_echo_feedback"):
+        if self._item_flags.get("fx_echo_feedback", True):
             self._cached_echo_feedback = float(dpg.get_value("fx_echo_feedback"))
-        if dpg.does_item_exist("fx_robot_freq"):
+        if self._item_flags.get("fx_robot_freq", True):
             self._cached_robot_freq    = float(dpg.get_value("fx_robot_freq"))
-        if dpg.does_item_exist("fx_deep_pitch"):
+        if self._item_flags.get("fx_deep_pitch", True):
             self._cached_deep_pitch    = float(dpg.get_value("fx_deep_pitch"))
-        if dpg.does_item_exist("fx_delay_time"):
+        if self._item_flags.get("fx_delay_time", True):
             self._cached_delay_time    = float(dpg.get_value("fx_delay_time"))
 
         # Drain the audio queue — shared by both display modes
@@ -782,38 +875,119 @@ class AudioOscilloscopeDPG:
                     self.audio_data[:virtual_write_pos]
                 ])
 
+            # Decimate to a bounded point count (envelope min/max) — the raw
+            # 450k-point upload per frame is what stalls the GUI the most.
+            visible_y_np = self._decimate_for_display(visible_y_np)
+
             current_peak = np.max(np.abs(visible_y_np))
-            norm_peak = min(1.0, float(current_peak))
-            r = int(min(255, norm_peak * 2 * 255))
-            g = int(min(255, (1.0 - norm_peak) * 2 * 255))
-            b = 50
 
-            dpg.set_value("wave_line_color",  (r, g, b, 255))
-            dpg.set_value("wave_shade_color",  (r, g, b, 60))
+            # ── Feature 1: fast-attack / slow-release envelope follower ──────
+            # The shade colour is driven by the smoothed level instead of the
+            # raw instantaneous peak, so it rises instantly on a transient but
+            # decays gradually ("phosphor glow" feel).  Attack ≈ 0.4, release
+            # ≈ 0.03 of the leftover per frame.
+            inst_level = min(1.0, float(current_peak))
+            env = self._env_level
+            if inst_level > env:
+                env += (inst_level - env) * 0.40   # attack
+            else:
+                env += (inst_level - env) * 0.08   # release
+            self._env_level = env
 
-            if visible_points != self.last_visible_points:
-                self.x_data_cache    = np.arange(visible_points, dtype=np.float32)
-                self.zero_line_cache = np.zeros(visible_points,  dtype=np.float32)
-                self.last_visible_points = visible_points
+            # Shade band decision with a hold lag: a candidate band must
+            # persist before the colour moves, so a transient blip near a
+            # band edge cannot flip the tint frame-to-frame and it stays
+            # put between peaks.  On a slow timebase the trace takes many
+            # seconds to cross the screen and every band is present, which
+            # reads as "several colours competing"; the hold is therefore
+            # scaled to the timebase as a fraction of the screen sweep
+            # (5–10 %), so slow sweeps get a long hold and fast ones a
+            # short one.  Once committed, the colour eases old → new band.
+            _screen_secs = visible_points / self.stream_samplerate
+            _hold_frames = int(SHADE_BAND_HOLD_SCREEN * _screen_secs
+                               * SHADE_TICK_RATE)
+            _hold_frames = max(SHADE_BAND_HOLD_FRAMES, _hold_frames)
+
+            _band = min(3, max(0, int(env * 4.0)))
+            if _band != self._shade_band:
+                self._shade_band_hold += 1
+                if self._shade_band_hold >= _hold_frames:
+                    self._shade_band      = _band
+                    self._shade_color_dst = ZONE_COLS[_band]
+                    self._shade_band_hold = 0
+            else:
+                self._shade_band_hold = 0
+
+            _c = self._shade_color_cur
+            if _c != self._shade_color_dst:
+                _step = 1.0 / SHADE_BAND_EASE_FRAMES
+                _c = tuple(int(round(a + (b - a) * _step))
+                           for a, b in zip(_c, self._shade_color_dst))
+                if all(abs(a - b) <= 1 for a, b in zip(_c, self._shade_color_dst)):
+                    _c = self._shade_color_dst
+                self._shade_color_cur = _c
+            dpg.set_value("wave_shade_color", (*_c, SHADE_ALPHA))
+
+            _disp_len = int(visible_y_np.size)
+            if _disp_len != self.last_visible_points:
+                self.x_data_cache    = np.arange(_disp_len, dtype=np.float32)
+                self.zero_line_cache = np.zeros(_disp_len,  dtype=np.float32)
+                self.last_visible_points = _disp_len
+
+            # ── Feature 2: amplitude-zoned trace by LAGGED average ───────────
+            # Split the (already min/max-decimated) waveform into the 4 colour
+            # bands, but the band key is the TRAILING AVERAGE of |amplitude|
+            # over the lag window (SHADE_BAND_HOLD_SCREEN of the sweep), NOT
+            # each pair's instantaneous peak.  A cycle entering the display
+            # therefore paints the colour of the average level of the recent
+            # lag — sustained loud passages hold amber/red, quiet ones blue —
+            # and the colour assignment for any screen position only changes
+            # as new data flows in, instead of being re-assigned on every
+            # wave cycle.  Assignment stays per PAIR (min+max edge kept
+            # together) so vertical edges never split, and NaN breaks the
+            # polyline between bands as before.
+            _n = visible_y_np.size
+            if _n >= 2:
+                _pairs = np.abs(visible_y_np[:_n - (_n % 2)].reshape(-1, 2)).max(axis=1)
+                _n_pairs = _pairs.size
+                _lag = max(1, round(_n_pairs * SHADE_BAND_HOLD_SCREEN))
+                # trailing mean of |amplitude| over the lag window (cumsum,
+                # O(n), no per-frame convolution cost)
+                _cs = np.concatenate(([0.0], np.cumsum(_pairs)))
+                _lag_avg = (_cs[_lag:] - _cs[:-_lag]) / _lag
+                _lag_avg = np.concatenate((_pairs[:_lag], _lag_avg))[:_n_pairs]
+                _pair_zone = np.digitize(np.clip(_lag_avg, 0.0, 1.0),
+                                         ZONE_EDGES[1:-1])
+                _zone_map  = np.repeat(_pair_zone, 2)
+                _x_zone    = self.x_data_cache[:_zone_map.size]
+                for _zk in range(4):
+                    _yz = np.where(_zone_map == _zk, visible_y_np[:_zone_map.size],
+                                   np.nan).astype(np.float32)
+                    dpg.set_value(f"waveform_zone_{_zk}", [_x_zone, _yz])
 
             dpg.set_value("waveform_shade", [self.x_data_cache, visible_y_np, self.zero_line_cache])
-            dpg.set_value("waveform_line",  [self.x_data_cache, visible_y_np])
-            dpg.set_axis_limits("x_axis", 0, visible_points)
+            dpg.set_axis_limits("x_axis", 0, _disp_len)
 
         # ── SPECTROGRAPH MODE ────────────────────────────────────────────────
         else:
             # Rebuild freq axis if zoom sliders changed
-            if dpg.does_item_exist("spec_freq_min") and dpg.does_item_exist("spec_freq_max"):
+            if self._item_flags.get("spec_freq_min", True) and self._item_flags.get("spec_freq_max", True):
                 fmin = float(dpg.get_value("spec_freq_min"))
                 fmax = float(dpg.get_value("spec_freq_max"))
                 if (fmin, fmax) != self._spec_zoom_cache_key:
                     self._build_spec_freq_axis(fmin, fmax)
 
+            # Refresh spectrograph slider caches once per frame (not per FFT row)
+            if self._item_flags.get("spec_persist", True):
+                self._spec_persist = float(dpg.get_value("spec_persist"))
+            if self._item_flags.get("spec_gain_db", True):
+                self._spec_gain_db = float(dpg.get_value("spec_gain_db"))
+
             # Derive scroll speed from Timebase slider:
             # small timebase → fast scroll (zoomed in), large → slow (more history).
             # step = round( (total_texture_samples) / timebase )
             # where total_texture_samples = SPEC_TEX_H * SPEC_HOP (samples to fill screen).
-            timebase = float(dpg.get_value("speed_slider")) if dpg.does_item_exist("speed_slider") else SPEC_TEX_H * SPEC_HOP
+            timebase = float(dpg.get_value("speed_slider")) if self._item_flags.get("speed_slider", True) else SPEC_TEX_H * SPEC_HOP
             scroll_step = max(1, round(SPEC_TEX_H * SPEC_HOP / max(timebase, 1)))
 
             if chunks:
@@ -948,9 +1122,9 @@ class AudioOscilloscopeDPG:
                 # Vertical column: three slider rows stacked inside the button height
                 with dpg.group(horizontal=False):
                     with dpg.group(horizontal=True):
-                        dpg.add_text("Mic Level (%):")
+                        dpg.add_text("Mic Gain (%):")
                         dpg.add_slider_float(label="##in_gain", tag="in_gain_slider",
-                                             default_value=100.0, min_value=0.0,
+                                             default_value=50.0, min_value=0.0,
                                              max_value=100.0,
                                              callback=self.update_gains, width=180)
                         dpg.add_spacer(width=8)
@@ -1036,12 +1210,11 @@ class AudioOscilloscopeDPG:
                         dpg.add_theme_color(dpg.mvThemeCol_Border,  (80, 80, 80, 255), category=dpg.mvThemeCat_Core)
                         dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (20, 20, 20, 255), category=dpg.mvThemeCat_Core)
 
+                # Phosphor fill theme — colour driven per-frame by the
+                # smoothed amplitude envelope (tag below is updated live).
                 with dpg.theme() as wave_shader_theme:
-                    with dpg.theme_component(dpg.mvLineSeries):
-                        dpg.add_theme_color(dpg.mvPlotCol_Line, (0, 255, 100, 255),
-                                            category=dpg.mvThemeCat_Plots, tag="wave_line_color")
                     with dpg.theme_component(dpg.mvShadeSeries):
-                        dpg.add_theme_color(dpg.mvPlotCol_Fill, (0, 255, 100, 50),
+                        dpg.add_theme_color(dpg.mvPlotCol_Fill, (0, 255, 100, SHADE_ALPHA),
                                             category=dpg.mvThemeCat_Plots, tag="wave_shade_color")
 
                 with dpg.plot(label="Analog Phosphor Scope", height=-1, width=-1, tag="plot_main"):
@@ -1049,11 +1222,24 @@ class AudioOscilloscopeDPG:
                     dpg.add_plot_axis(dpg.mvYAxis, label="Amplitude", tag="y_axis")
                     dpg.set_axis_limits("y_axis", -1.0, 1.0)
                     dpg.add_shade_series([], [], tag="waveform_shade", parent="y_axis")
-                    dpg.add_line_series( [], [], tag="waveform_line",  parent="y_axis")
+                    # 4 amplitude-zoned traces — segments of the waveform are
+                    # drawn in the band colour derived from the LAGGED average
+                    # amplitude (see render loop); NaN breaks the line between
+                    # bands.  Colours persist with the data as it scrolls.
+                    for _zk in range(4):
+                        dpg.add_line_series([], [], tag=f"waveform_zone_{_zk}",
+                                            parent="y_axis")
 
                 dpg.bind_item_theme("plot_main",      plot_theme)
-                dpg.bind_item_theme("waveform_line",  wave_shader_theme)
                 dpg.bind_item_theme("waveform_shade", wave_shader_theme)
+                # One static theme per zone colour (blue → green → amber → red)
+                for _zk, _col in enumerate(ZONE_COLS):
+                    with dpg.theme() as _zt:
+                        with dpg.theme_component(dpg.mvLineSeries):
+                            dpg.add_theme_color(dpg.mvPlotCol_Line,
+                                                (*_col, 255),
+                                                category=dpg.mvThemeCat_Plots)
+                    dpg.bind_item_theme(f"waveform_zone_{_zk}", _zt)
 
             # =================================================================
             # SPECTROGRAPH PANEL  (hidden by default)
@@ -1139,6 +1325,10 @@ class AudioOscilloscopeDPG:
         _frame_budget = 1.0 / 60.0
         _LOGO_PAD = 10
 
+        # Snapshot item-existence once — the render loop reads these flags
+        # instead of calling dpg.does_item_exist() every frame.
+        self._snapshot_item_flags()
+
         print("Entering main render loop...")
         while dpg.is_dearpygui_running():
             _t0 = time.perf_counter()
@@ -1155,13 +1345,15 @@ class AudioOscilloscopeDPG:
                     try:
                         rect = dpg.get_item_rect_size("spec_waterfall_win")
                         dw, dh = int(rect[0]), int(rect[1])
-                        if dw > 1 and dh > 1:
+                        if dw > 1 and dh > 1 and (dw, dh) != self._spec_draw_dim:
                             dpg.configure_item("spec_drawlist", width=dw, height=dh)
                             dpg.configure_item("spec_draw_img", pmax=[dw, dh])
+                            self._spec_draw_dim = (dw, dh)
                     except Exception:
                         pass
 
-                # Reposition frequency-axis labels at log-spaced pixel positions
+                # Reposition frequency-axis labels at log-spaced pixel positions —
+                # only when the window width or zoom range actually changed.
                 if dpg.does_item_exist("spec_freq_drawlist"):
                     try:
                         # Use the waterfall child_window width as the reference pixel width
@@ -1170,13 +1362,14 @@ class AudioOscilloscopeDPG:
                         else:
                             rect = dpg.get_item_rect_size("spec_freq_drawlist")
                         lw = int(rect[0]) if rect else 0
-                        # Also keep the freq drawlist in sync with actual width
-                        if lw > 4:
+                        fmin = float(dpg.get_value("spec_freq_min")) \
+                            if dpg.does_item_exist("spec_freq_min") else 20.0
+                        fmax = float(dpg.get_value("spec_freq_max")) \
+                            if dpg.does_item_exist("spec_freq_max") else 20000.0
+                        new_key = (lw, fmin, fmax)
+                        if lw > 4 and new_key != self._spec_label_key:
+                            # Also keep the freq drawlist in sync with actual width
                             dpg.configure_item("spec_freq_drawlist", width=lw)
-                            fmin = float(dpg.get_value("spec_freq_min")) \
-                                if dpg.does_item_exist("spec_freq_min") else 20.0
-                            fmax = float(dpg.get_value("spec_freq_max")) \
-                                if dpg.does_item_exist("spec_freq_max") else 20000.0
                             log_total = np.log10(max(fmax, fmin + 1) / max(fmin, 1.0))
                             for _i, (_freq, _txt) in enumerate(
                                     zip(self._spec_label_freqs, self._spec_label_texts)):
@@ -1189,6 +1382,7 @@ class AudioOscilloscopeDPG:
                                                            color=(160, 210, 160, 255))
                                     else:
                                         dpg.configure_item(_tag, color=(0, 0, 0, 0))
+                            self._spec_label_key = new_key
                     except Exception:
                         pass
 

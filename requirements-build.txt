@@ -1,9 +1,10 @@
-# Build-time dependencies (Windows only — produces the installer .exe)
-# Install with:  pip install -r requirements-build.txt
+# Build-time dependency. Used on Windows (build.ps1 → the .exe),
+# Linux and macOS (build.sh → the binary).
 #
-# Also requires Inno Setup 6 (free): https://jrsoftware.org/isdl.php
-# Default install path expected by build.ps1:
-#   C:\Program Files (x86)\Inno Setup 6\ISCC.exe
+# Windows extra: Inno Setup 6 (free): https://jrsoftware.org/isdl.php
+#   ISCC.exe expected at "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+#
+# Linux runtime requirement (not bundled by PyInstaller):
+#   Ubuntu:  sudo apt install libportaudio2
 
 pyinstaller>=6.0.0
-

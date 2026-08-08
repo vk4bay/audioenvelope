@@ -1,11 +1,12 @@
 # Build Instructions — Audio Envelope Oscilloscope
 
-These instructions produce two distributable files from the Python source:
+These instructions produce distributable files from the Python source:
 
-| Output file | Purpose |
-|---|---|
-| `dist\AudioEnvelope.exe` | Single executable — copy anywhere and run |
-| `dist\AudioEnvelope_Setup.exe` | Windows installer with Start Menu, desktop icon and uninstaller |
+| Output file | Platform | Purpose |
+|---|---|---|
+| `dist\AudioEnvelope.exe` | Windows | Single executable — copy anywhere and run |
+| `dist\AudioEnvelope_Setup.exe` | Windows | Windows installer with Start Menu, desktop icon and uninstaller |
+| `dist/AudioEnvelope` | Linux / macOS | Single binary — copy anywhere and run |
 
 ---
 
@@ -119,9 +120,81 @@ Installer ready: dist\AudioEnvelope_Setup.exe  [~29 MB]
 
 | File | Purpose |
 |---|---|
-| `build.ps1` | PowerShell build script — entry point for all builds |
-| `AudioEnvelope.spec` | PyInstaller specification — controls what is bundled |
-| `installer.iss` | Inno Setup script — controls the installer package |
+| `build.ps1` | PowerShell build script (Windows) — entry point for exe/installer builds |
+| `build.sh` | Bash build script (Linux/macOS) — entry point for binary builds |
+| `AudioEnvelope.spec` | PyInstaller specification — controls what is bundled (cross-platform) |
+| `installer.iss` | Inno Setup script — controls the Windows installer package |
+
+---
+
+## Building on Linux (Ubuntu)
+
+These commands produce a **single self-contained binary**: `dist/AudioEnvelope`.
+No Python or packages are needed on the target machine.
+
+### 1. Prerequisites (build machine)
+
+```bash
+# Python 3.11+ and PortAudio (audio runtime lib, not bundled):
+sudo apt install python3 python3-venv libportaudio2
+
+# Project dependencies (a .venv in the project folder is auto-detected by build.sh):
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+Optional but recommended on Linux — removes audio stutter from the GIL:
+
+```bash
+.venv/bin/pip install scipy
+```
+
+(Do not install `_sounddevice_data` — that package is Windows-only; the spec
+detects its absence and uses the system libportaudio instead.)
+
+### 2. Asset files
+
+Place `bdars-logo.png` (required) and `NicerFont.ttf` (optional, falls back to
+default font) in the same folder as `main.py` — they are bundled automatically.
+
+### 3. Build
+
+```bash
+./build.sh
+```
+
+What the script does:
+
+1. Finds Python — uses `.venv/bin/python` if present, else system `python3`
+2. Installs PyInstaller into that Python if missing
+3. Deletes previous `build/` and `dist/` folders
+4. Runs `pyinstaller AudioEnvelope.spec`
+
+Expected result:
+
+```
+Build successful: dist/AudioEnvelope  [~65 MB]
+```
+
+### 4. Run
+
+```bash
+./dist/AudioEnvelope
+```
+
+If there is no audio device access (ALSA permission errors), add your user to
+the `audio` group and log out/in once:
+
+```bash
+sudo usermod -aG audio "$USER"
+```
+
+### 5. Deploying to another Linux/Mac machine
+
+Copy `dist/AudioEnvelope` to the target machine and execute it. The target needs:
+
+- A desktop session (X11/Wayland) for the GUI
+- `libportaudio2` installed (Ubuntu: `sudo apt install libportaudio2`)
 
 ---
 
