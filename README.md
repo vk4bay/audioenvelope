@@ -14,7 +14,7 @@ Built with Python, DearPyGui, NumPy and sounddevice.
   - **Chipmunk** — pitch shifted up ×2
   - **Voice Pitch** — continuously variable pitch (0.25× – 4×) via slider
   - **Echo** — configurable delay and feedback
-  - **Robot** — dual square-wave ring modulation + comb filter
+  - **Robot** — ring-modulated voice with bit-crushed speech layer + comb sustain (carrier notch removes the buzz line)
 - **Output delay** — 0 – 10 s delay on all output paths (prevents acoustic feedback)
 - **Fullscreen on any monitor** — correctly targets whichever display the window is dragged to in a dual-monitor setup
 - **Branding overlay** — logo displayed in the top-right corner, auto-repositioned on resize/fullscreen

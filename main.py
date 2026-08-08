@@ -27,7 +27,7 @@ else:
 
 # ── Application identity ────────────────────────────────────────────────────
 # Version string: bump the minor number with every released change.
-APP_VERSION = "7.8"                     # bump minor on each change
+APP_VERSION = "7.11"                    # bump minor on each change
 APP_TITLE   = f"Real-Time Oscilloscope V{APP_VERSION}"   # single definition used everywhere
 
 # ── Windows-only: monitor-aware borderless fullscreen via Win32 API ──────────
@@ -53,6 +53,13 @@ if _IS_WINDOWS:
 
 # Seconds of audio held in the pitch-shift ring buffer.
 PITCH_BUF_SECS = 4.0
+
+# Q factor of the notch filter applied to the ROBOT effect's output.  The
+# robot voice is built from a 100 Hz square-wave carrier whose fundamental
+# leaks through as a constant hum whenever the microphone picks up noise/DC;
+# the notch cancels the carrier line wide enough to suppress it solidly
+# while leaving the voice sidebands on either side intact.
+ROBOT_NOTCH_Q = 5.0
 
 # =============================================================================
 # SPECTROGRAPH CONSTANTS
@@ -106,14 +113,33 @@ SPEC_DB_MAX   =  20.0                       # dB ceiling (maps to colour 1)
                                             # ~5× less colour sensitivity, keeping
                                             # normal speech in the blue-green range.
 
+# ── Branding overlay (BDARS logo) ─────────────────────────────────────────────
+LOGO_MAX_W      = 180    # max display width; height scales with the aspect ratio
+LOGO_PAD        = 10     # gap between the logo and the window edge
+LOGO_RIGHT_MARGIN = 40    # visible breathing-room from the right edge
+LOGO_Y_FALLBACK = 150    # vertical position used until the GUI layout is known
+
+# ── Gain slider defaults ────────────────────────────────────────────────────
+# Default positions on the 0-100 scales.  The initial gains are pre-computed
+# from these with the same mapping as update_gains() so the gains at startup
+# match the sliders instead of jumping to the extremes before they are moved.
+IN_GAIN_SLIDER_DEFAULT  = 50.0
+OUT_GAIN_SLIDER_DEFAULT = 5.0
+
+# Robot modulation frequency at startup, Hz (slider default + notch tuning).
+ROBOT_FREQ_DEFAULT = 67.5
+
 
 class AudioOscilloscopeDPG:
     def __init__(self):
         print("Initializing Audio System (V7 - Effects Edition)...")
         self.stream = None
         self.is_running = False
-        self.input_gain = 500.0   # 100 % on the 0-100 slider = slider × 5 = 500× gain
-        self.output_gain = 0.0    # 0 % default -- no speaker feedback at start
+        # The exponential formula duplicated from update_gains(): starting
+        # gain must match where the slider sits at launch, otherwise the mic
+        # is hot (500×) until the slider is first touched.
+        self.input_gain = 0.05 * (1000.0 ** (IN_GAIN_SLIDER_DEFAULT / 100.0))
+        self.output_gain = OUT_GAIN_SLIDER_DEFAULT / 100.0   # 5 % -- quiet at start
 
         # --- Oscilloscope ring buffer ---
         self.max_points = 500000
@@ -162,10 +188,20 @@ class AudioOscilloscopeDPG:
         self.delay_buf2 = np.zeros(int(44100 * 11), dtype=np.float32)
         self.delay_write_pos2 = 0
 
-        # Robot effect: carrier phase accumulator + comb-filter ring buffer
+        # Robot effect: carrier phase accumulator + comb-filter ring buffer,
+        # plus the bit-crush / voice-mix layers (see _apply_robot)
         self.robot_phase = 0.0
         self.robot_comb_buf = np.zeros(0, dtype=np.float32)
         self.robot_comb_pos = 0
+
+        # Notch filter applied to the Robot effect output (cancels the
+        # 100 Hz modulation carrier hum).  Coefficients rebuilt whenever the
+        # Robot Freq slider moves, exactly like the two HPFs.
+        self._notch_coeffs = None          # (b0,b1,b2,a1,a2) normalised by a0
+        self._notch_sos    = None          # shape (1,6) SOS matrix for sosfilt
+        self._notch_freq   = None          # Hz it was last built for
+        self._notch_z1     = 0.0           # biquad delay element 1
+        self._notch_z2     = 0.0           # biquad delay element 2
 
         # Monitor-aware fullscreen state
         self._is_fullscreen  = False
@@ -206,6 +242,17 @@ class AudioOscilloscopeDPG:
         self._hpf_z1     = 0.0           # biquad delay element 1
         self._hpf_z2     = 0.0           # biquad delay element 2
 
+        # OUTPUT high-pass filter (same 2nd-order Butterworth biquad, applied
+        # to the FINAL waveform right before it leaves the callback).  Kills
+        # the ~50–120 Hz hum/buzz that the pitch-shift and robot effects put
+        # on the noise floor.  The "Out HPF" slider sets the cutoff, i.e. how
+        # much low-frequency attenuation is applied.
+        self._out_hpf_cutoff = 100.0     # Hz — default ~100 Hz hum notch
+        self._out_hpf_coeffs = None
+        self._out_hpf_sos    = None
+        self._out_hpf_z1     = 0.0
+        self._out_hpf_z2     = 0.0
+
         # Pre-allocated index array reused by delay/robot effects inside the
         # audio callback — avoids 7× np.arange heap allocations per callback.
         self._frame_indices = np.arange(128, dtype=np.intp)
@@ -222,7 +269,7 @@ class AudioOscilloscopeDPG:
         # ----------------------------------------------------------------
         self._cached_echo_delay    = 300.0
         self._cached_echo_feedback = 0.40
-        self._cached_robot_freq    = 100.0
+        self._cached_robot_freq    = ROBOT_FREQ_DEFAULT
         self._cached_deep_pitch    = 0.45
         self._cached_delay_time    = 0.0
 
@@ -349,7 +396,14 @@ class AudioOscilloscopeDPG:
         carrier2 = np.sign(np.sin(4.0 * np.pi * freq * t + self.robot_phase * 2.0)).astype(np.float32)
         self.robot_phase = (self.robot_phase + phase_inc) % (2.0 * np.pi)
 
-        modulated = signal * (carrier1 + 0.30 * carrier2)
+        # 7-level "bit-crushed" copy of the voice: keeps the phrasing legible
+        # underneath the carrier (the original effect multiplied the raw signal,
+        # which zeroed every harmonic and left the thin, barely-words mush).
+        # The crush also adds the coarse "broadcast/register" grit that sells
+        # the robot/Dalek-radio quality, separate from the ring.
+        crushed = np.round(np.clip(signal, -1.0, 1.0) * 7.0) / 7.0
+
+        modulated = crushed * (carrier1 + 0.30 * carrier2)
 
         if len(self.robot_comb_buf) > 0:
             buf  = self.robot_comb_buf
@@ -364,7 +418,18 @@ class AudioOscilloscopeDPG:
         else:
             combed = modulated
 
-        return np.tanh(combed * 1.8).astype(np.float32) * 0.65
+        # Re-mix the voice back in AFTER the ring: 60 % machine ring + 25 % clean
+        # crushed speech + 28 % untouched dry voice.  The speech stays thick and
+        # understandable ("EXTERMINATE!" lands) while the carrier and its comb
+        # sustain still drive the Daleky drone underneath.
+        voice = crushed * 0.25 + signal * 0.28
+        core  = combed * 0.47 + voice
+
+        core = np.tanh(core * 1.8).astype(np.float32) * 0.65
+
+        # Notch out the carrier fundamental so the ring buzz line is suppressed
+        # without touching the rest of the voice.
+        return self._apply_notch(core)
 
     # =================================================================
     # HIGH-PASS FILTER  (2nd-order Butterworth biquad)
@@ -434,6 +499,117 @@ class AudioOscilloscopeDPG:
         self._hpf_z2 = z2
         return out
 
+    # ------------------------------------------------------------------
+    # OUTPUT HIGH-PASS FILTER
+    # Same 2nd-order Butterworth biquad as the input HPF but applied to the
+    # final FX output to strip the ~50–120 Hz hum that pitch-shift and robot
+    # effects impress onto the noise floor.  Identical cheap machinery, so no
+    # new DSP code path — coefficients are rebuilt when the "Out HPF" slider
+    # moves, exactly like the input filter.
+    # ------------------------------------------------------------------
+
+    def _build_out_hpf_coeffs(self, cutoff_hz):
+        sr  = max(self.stream_samplerate, 8000.0)
+        fc  = max(10.0, min(float(cutoff_hz), sr * 0.45))
+        w0  = 2.0 * np.pi * fc / sr
+        Q   = 0.7071
+        sin_w0 = np.sin(w0)
+        cos_w0 = np.cos(w0)
+        alpha  = sin_w0 / (2.0 * Q)
+
+        b0 =  (1.0 + cos_w0) / 2.0
+        b1 = -(1.0 + cos_w0)
+        b2 =  (1.0 + cos_w0) / 2.0
+        a0 =   1.0 + alpha
+        a1 =  -2.0 * cos_w0
+        a2 =   1.0 - alpha
+
+        self._out_hpf_coeffs = (b0/a0, b1/a0, b2/a0, a1/a0, a2/a0)
+        self._out_hpf_sos    = np.array([[b0/a0, b1/a0, b2/a0, 1.0, a1/a0, a2/a0]],
+                                         dtype=np.float64)
+        self._out_hpf_cutoff = cutoff_hz
+        self._out_hpf_z1     = 0.0
+        self._out_hpf_z2     = 0.0
+
+    def _apply_out_hpf(self, signal):
+        if self._out_hpf_coeffs is None:
+            return signal
+        if _HAVE_SCIPY and self._out_hpf_sos is not None:
+            zi = np.array([[self._out_hpf_z1, self._out_hpf_z2]], dtype=np.float64)
+            out, zf = _sosfilt(self._out_hpf_sos, signal.astype(np.float64), zi=zi)
+            self._out_hpf_z1 = float(zf[0, 0])
+            self._out_hpf_z2 = float(zf[0, 1])
+            return out.astype(np.float32)
+        b0, b1, b2, a1, a2 = self._out_hpf_coeffs
+        n   = len(signal)
+        out = np.empty(n, dtype=np.float32)
+        z1, z2 = self._out_hpf_z1, self._out_hpf_z2
+        for i in range(n):
+            x    = float(signal[i])
+            y    = b0 * x + z1
+            z1   = b1 * x - a1 * y + z2
+            z2   = b2 * x - a2 * y
+            out[i] = y
+        self._out_hpf_z1 = z1
+        self._out_hpf_z2 = z2
+        return out
+
+    # ------------------------------------------------------------------
+    # ROBOT NOTCH FILTER  (2nd-order biquad band-stop)
+    # Cancels the Robot effect's square-wave carrier fundamental at the
+    # Robot Freq slider setting.  The carrier is phase-locked to the slider,
+    # so the notch is razor-tuned to that one line; voice sidebands around
+    # it pass through.  Identical machinery/state handling to the HPFs.
+    # ------------------------------------------------------------------
+
+    def _build_notch_coeffs(self, freq_hz):
+        """Compute and cache biquad notch coefficients (Audio EQ Cookbook,
+        Q = ROBOT_NOTCH_Q).  Resets the delay elements so no click on update."""
+        sr  = max(self.stream_samplerate, 8000.0)
+        fc  = max(10.0, min(float(freq_hz), sr * 0.45))
+        w0  = 2.0 * np.pi * fc / sr
+        alpha = np.sin(w0) / (2.0 * ROBOT_NOTCH_Q)
+        cos_w0 = np.cos(w0)
+
+        b0 = 1.0
+        b1 = -2.0 * cos_w0
+        b2 = 1.0
+        a0 = 1.0 + alpha
+        a1 = -2.0 * cos_w0
+        a2 = 1.0 - alpha
+
+        self._notch_coeffs = (b0/a0, b1/a0, b2/a0, a1/a0, a2/a0)
+        self._notch_sos    = np.array([[b0/a0, b1/a0, b2/a0, 1.0, a1/a0, a2/a0]],
+                                       dtype=np.float64)
+        self._notch_freq = float(freq_hz)
+        self._notch_z1   = 0.0
+        self._notch_z2   = 0.0
+
+    def _apply_notch(self, signal):
+        """Notch the signal at the cached robot-carrier frequency
+        (scipy sosfilt when available, pure-Python fallback otherwise)."""
+        if self._notch_coeffs is None:
+            return signal
+        if _HAVE_SCIPY and self._notch_sos is not None:
+            zi = np.array([[self._notch_z1, self._notch_z2]], dtype=np.float64)
+            out, zf = _sosfilt(self._notch_sos, signal.astype(np.float64), zi=zi)
+            self._notch_z1 = float(zf[0, 0])
+            self._notch_z2 = float(zf[0, 1])
+            return out.astype(np.float32)
+        b0, b1, b2, a1, a2 = self._notch_coeffs
+        n   = len(signal)
+        out = np.empty(n, dtype=np.float32)
+        z1, z2 = self._notch_z1, self._notch_z2
+        for i in range(n):
+            x  = float(signal[i])
+            y  = b0 * x + z1
+            z1 = b1 * x - a1 * y + z2
+            z2 = b2 * x - a2 * y
+            out[i] = y
+        self._notch_z1 = z1
+        self._notch_z2 = z2
+        return out
+
     # =================================================================
     # AUDIO CALLBACK  (hardware C-thread -- keep allocations minimal)
     # =================================================================
@@ -458,6 +634,7 @@ class AudioOscilloscopeDPG:
             fx_out = processed_in
 
         fx_out = self._apply_pure_delay(fx_out)
+        fx_out = self._apply_out_hpf(fx_out)
         outdata[:, 0] = np.clip(fx_out * self.output_gain, -1.0, 1.0)
 
         if self.is_running:
@@ -529,6 +706,16 @@ class AudioOscilloscopeDPG:
             hpf_cutoff = float(dpg.get_value("hpf_cutoff")) \
                 if dpg.does_item_exist("hpf_cutoff") else self._hpf_cutoff
             self._build_hpf_coeffs(hpf_cutoff)
+
+            # Output HPF (hum removal on the FX output path)
+            out_hpf_cutoff = float(dpg.get_value("out_hpf_cutoff")) \
+                if dpg.does_item_exist("out_hpf_cutoff") else self._out_hpf_cutoff
+            self._build_out_hpf_coeffs(out_hpf_cutoff)
+
+            # Robot-carrier notch (same slider source the callback uses)
+            robot_freq = float(dpg.get_value("fx_robot_freq")) \
+                if dpg.does_item_exist("fx_robot_freq") else self._cached_robot_freq
+            self._build_notch_coeffs(robot_freq)
 
             try:
                 # Linux ALSA needs a larger blocksize to tolerate Python GIL
@@ -801,7 +988,7 @@ class AudioOscilloscopeDPG:
     def _snapshot_item_flags(self):
         """Snapshot item-existence once so the render loop never calls
         dpg.does_item_exist() (a binder lookup each time) per frame."""
-        for tag in ("hpf_cutoff", "fx_echo_delay", "fx_echo_feedback",
+        for tag in ("hpf_cutoff", "out_hpf_cutoff", "fx_echo_delay", "fx_echo_feedback",
                     "fx_robot_freq", "fx_deep_pitch", "fx_delay_time",
                     "speed_slider", "spec_persist", "spec_gain_db",
                     "spec_freq_min", "spec_freq_max", "spec_texture",
@@ -820,6 +1007,11 @@ class AudioOscilloscopeDPG:
             _hpf_val = float(dpg.get_value("hpf_cutoff"))
             if abs(_hpf_val - self._hpf_cutoff) > 0.5:
                 self._build_hpf_coeffs(_hpf_val)
+        # Re-build OUTPUT HPF coefficients if its slider moved
+        if self._item_flags.get("out_hpf_cutoff", True):
+            _out_val = float(dpg.get_value("out_hpf_cutoff"))
+            if abs(_out_val - self._out_hpf_cutoff) > 0.5:
+                self._build_out_hpf_coeffs(_out_val)
 
         # Refresh cached slider values so the audio C-thread never calls dpg.get_value()
         if self._item_flags.get("fx_echo_delay", True):
@@ -828,6 +1020,9 @@ class AudioOscilloscopeDPG:
             self._cached_echo_feedback = float(dpg.get_value("fx_echo_feedback"))
         if self._item_flags.get("fx_robot_freq", True):
             self._cached_robot_freq    = float(dpg.get_value("fx_robot_freq"))
+            # Keep the robot-carrier notch locked to the slider frequency
+            if self._notch_freq != self._cached_robot_freq:
+                self._build_notch_coeffs(self._cached_robot_freq)
         if self._item_flags.get("fx_deep_pitch", True):
             self._cached_deep_pitch    = float(dpg.get_value("fx_deep_pitch"))
         if self._item_flags.get("fx_delay_time", True):
@@ -951,11 +1146,15 @@ class AudioOscilloscopeDPG:
                 _pairs = np.abs(visible_y_np[:_n - (_n % 2)].reshape(-1, 2)).max(axis=1)
                 _n_pairs = _pairs.size
                 _lag = max(1, round(_n_pairs * SHADE_BAND_HOLD_SCREEN))
-                # trailing mean of |amplitude| over the lag window (cumsum,
-                # O(n), no per-frame convolution cost)
+                # trailing mean of |amplitude| over the lag window for EVERY
+                # position (cumsum, O(n), no per-frame convolution cost).
+                # The window shrinks at the left edge (partial-history pairs
+                # are still AVERAGED, never keyed on a raw pair peak — that
+                # made the trace flare red just before scrolling off-screen).
+                _j = np.arange(1, _n_pairs + 1)
+                _wstart = np.maximum(0, _j - _lag)
                 _cs = np.concatenate(([0.0], np.cumsum(_pairs)))
-                _lag_avg = (_cs[_lag:] - _cs[:-_lag]) / _lag
-                _lag_avg = np.concatenate((_pairs[:_lag], _lag_avg))[:_n_pairs]
+                _lag_avg = (_cs[_j] - _cs[_wstart]) / (_j - _wstart)
                 _pair_zone = np.digitize(np.clip(_lag_avg, 0.0, 1.0),
                                          ZONE_EDGES[1:-1])
                 _zone_map  = np.repeat(_pair_zone, 2)
@@ -1022,7 +1221,7 @@ class AudioOscilloscopeDPG:
                 print(f"Warning: bdars-logo.png not found at {logo_path}")
             else:
                 raw_w, raw_h, _, raw_data = _result
-                max_display_w = 253
+                max_display_w = LOGO_MAX_W
                 self._logo_w = min(max_display_w, raw_w)
                 self._logo_h = int(raw_h * self._logo_w / raw_w)
                 with dpg.texture_registry(tag="logo_tex_registry"):
@@ -1106,10 +1305,15 @@ class AudioOscilloscopeDPG:
                                      default_value=int(self.max_points * 0.9),
                                      min_value=500, max_value=self.max_points, width=175)
                 dpg.add_spacer(width=8)
-                dpg.add_text("HP Filter:")
+                dpg.add_text("In HPF:")
                 dpg.add_slider_float(label="##hpf_cutoff", tag="hpf_cutoff",
                                      default_value=80.0, min_value=20.0,
                                      max_value=1000.0, width=160)
+                dpg.add_spacer(width=8)
+                dpg.add_text("Out HPF:")
+                dpg.add_slider_float(label="##out_hpf_cutoff", tag="out_hpf_cutoff",
+                                     default_value=100.0, min_value=20.0,
+                                     max_value=2000.0, width=160)
             dpg.add_spacer(height=5)
 
             # ---- Row 2: Start | stacked-sliders | Spectrograph | Fullscreen ------
@@ -1124,13 +1328,13 @@ class AudioOscilloscopeDPG:
                     with dpg.group(horizontal=True):
                         dpg.add_text("Mic Gain (%):")
                         dpg.add_slider_float(label="##in_gain", tag="in_gain_slider",
-                                             default_value=50.0, min_value=0.0,
+                                             default_value=IN_GAIN_SLIDER_DEFAULT, min_value=0.0,
                                              max_value=100.0,
                                              callback=self.update_gains, width=180)
                         dpg.add_spacer(width=8)
                         dpg.add_text("Output Volume (%):")
                         dpg.add_slider_float(label="##out_gain", tag="out_gain_slider",
-                                             default_value=0.0, max_value=100.0,
+                                             default_value=OUT_GAIN_SLIDER_DEFAULT, max_value=100.0,
                                              callback=self.update_gains, width=140)
                     with dpg.group(horizontal=True):
                         dpg.add_text("Out Delay (s):")
@@ -1193,7 +1397,7 @@ class AudioOscilloscopeDPG:
                 dpg.add_spacer(width=14)
                 dpg.add_text("Robot Freq (Hz):")
                 dpg.add_slider_float(label="##robot_freq", tag="fx_robot_freq",
-                                     default_value=100.0, min_value=20.0, max_value=400.0, width=160)
+                                     default_value=ROBOT_FREQ_DEFAULT, min_value=20.0, max_value=400.0, width=160)
 
 
             dpg.add_spacer(height=8)
@@ -1300,15 +1504,14 @@ class AudioOscilloscopeDPG:
         dpg.set_primary_window("Primary Window", True)
 
         # --- BDARS logo overlay --------------------------------------------------
-        _PAD = 10
         if self._logo_w > 0:
-            _init_x = dpg.get_viewport_width() - self._logo_w - _PAD * 2
+            _init_x = dpg.get_viewport_width() - self._logo_w - LOGO_RIGHT_MARGIN
             with dpg.window(tag="logo_win", no_title_bar=True, no_resize=True,
                             no_move=True, no_scrollbar=True, no_background=True,
                             no_focus_on_appearing=True,
-                            pos=[_init_x, _PAD],
-                            width=self._logo_w + _PAD,
-                            height=self._logo_h + _PAD):
+                            pos=[_init_x, LOGO_Y_FALLBACK],
+                            width=self._logo_w + LOGO_PAD,
+                            height=self._logo_h + LOGO_PAD):
                 dpg.add_image("bdars_logo_tex",
                               width=self._logo_w, height=self._logo_h)
 
@@ -1323,7 +1526,6 @@ class AudioOscilloscopeDPG:
         self._build_spec_freq_axis(20.0, 20000.0)
 
         _frame_budget = 1.0 / 60.0
-        _LOGO_PAD = 10
 
         # Snapshot item-existence once — the render loop reads these flags
         # instead of calling dpg.does_item_exist() every frame.
@@ -1335,8 +1537,18 @@ class AudioOscilloscopeDPG:
 
             if self._logo_w > 0 and dpg.does_item_exist("logo_win"):
                 _vp_w = dpg.get_viewport_client_width()
+                # Align the logo's TOP edge with the top of the Spectrograph
+                # / Fullscreen buttons so it clears the device/HPF slider row.
+                # Falls back to a fixed position until layout is measured.
+                _logo_y = LOGO_Y_FALLBACK
+                for _tag in ("disp_mode_btn", "fullscreen_btn"):
+                    if dpg.does_item_exist(_tag):
+                        _p = dpg.get_item_pos(_tag)
+                        if _p and _p[1] > 0:
+                            _logo_y = min(_logo_y, _p[1])
                 dpg.set_item_pos("logo_win",
-                                 [_vp_w - self._logo_w - _LOGO_PAD * 2, _LOGO_PAD])
+                                 [_vp_w - self._logo_w - LOGO_RIGHT_MARGIN,
+                                  _logo_y])
 
             # ── Spectrograph dynamic sizing (runs every frame when panel visible) ──
             if self.display_mode == 'spec':
