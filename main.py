@@ -212,6 +212,7 @@ class AudioOscilloscopeDPG:
         self._windowed_hwnd  = 0
         self._windowed_style = 0
         self._windowed_rect  = None
+        self._x11_geom       = None      # (x,y,w,h) before Linux fullscreen
 
         # =================================================================
         # SPECTROGRAPH STATE
@@ -772,9 +773,13 @@ class AudioOscilloscopeDPG:
 
     def toggle_fullscreen(self):
         if not _IS_WINDOWS:
-            # Linux / macOS: DearPyGui's built-in viewport fullscreen
-            self._is_fullscreen = not self._is_fullscreen
-            dpg.toggle_viewport_fullscreen()
+            if platform.system() == 'Linux':
+                # Linux: monitor-aware X11/XRandR fullscreen
+                self._toggle_fullscreen_x11()
+            else:
+                # macOS: DearPyGui's built-in viewport fullscreen
+                self._is_fullscreen = not self._is_fullscreen
+                dpg.toggle_viewport_fullscreen()
             return
 
         # Windows: Win32 API for true monitor-aware borderless fullscreen
@@ -812,6 +817,225 @@ class AudioOscilloscopeDPG:
                              l, t, r2 - l, b - t,
                              _SWP_FRAMECHANGED | _SWP_SHOWWINDOW)
             self._is_fullscreen = False
+
+    @staticmethod
+    def _x11_wayland_session():
+        """True when the current session is Wayland, where X11 window
+        manipulation is either unavailable or honoured by a WM that cannot
+        be directed (DPG falls back to its primary-monitor fullscreen)."""
+        return (os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+                or bool(os.environ.get("WAYLAND_DISPLAY")))
+
+    def _toggle_fullscreen_x11(self):
+        """Monitor-aware borderless fullscreen on Linux/X11.
+
+        DPG's built-in toggle_fullscreen() always jumps the viewport to
+        GLFW's PRIMARY monitor — i.e. the laptop LCD on a dual-monitor
+        setup — regardless of which screen the window is sitting on.
+        This implementation instead asks XRandR where the monitors are and
+        which one contains the window's centre, then resizes the window to
+        cover exactly that monitor (and restores the saved geometry when
+        toggled off).  Falls back to DPG's built-in fullscreen on Wayland
+        sessions and when the X11 libraries are unavailable.
+        """
+        if self._x11_wayland_session():
+            print("Wayland session detected -- using DPG fullscreen "
+                  "(switches to the primary monitor).")
+            self._is_fullscreen = not self._is_fullscreen
+            dpg.toggle_viewport_fullscreen()
+            return
+
+        try:
+            x11  = ctypes.CDLL("libX11.so.6")
+            xrr  = ctypes.CDLL("libXrandr.so.2")
+        except OSError:
+            print("libX11/libXrandr unavailable -- using DPG fullscreen.")
+            self._is_fullscreen = not self._is_fullscreen
+            dpg.toggle_viewport_fullscreen()
+            return
+
+        c_ulongp  = ctypes.POINTER(ctypes.c_ulong)
+        c_charp   = ctypes.POINTER(ctypes.c_char_p)
+        c_char    = ctypes.c_char_p
+
+        # --- prototype the small subset of Xlib / XRandR we need ---------
+        x11.XOpenDisplay.restype        = ctypes.c_void_p
+        x11.XOpenDisplay.argtypes       = [c_char]
+        x11.XDefaultRootWindow.restype  = ctypes.c_ulong
+        x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        x11.XQueryTree.restype          = ctypes.c_int
+        x11.XQueryTree.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                   c_ulongp, c_ulongp, ctypes.POINTER(c_ulongp), ctypes.POINTER(ctypes.c_int)]
+        x11.XFetchName.restype          = ctypes.c_int
+        x11.XFetchName.argtypes         = [ctypes.c_void_p, ctypes.c_ulong, c_charp]
+        x11.XFree.restype               = ctypes.c_int
+        x11.XFree.argtypes              = [ctypes.c_void_p]
+        x11.XGetGeometry.restype        = ctypes.c_int
+        x11.XGetGeometry.argtypes        = [ctypes.c_void_p, ctypes.c_ulong, c_ulongp]
+        x11.XTranslateCoordinates.restype = ctypes.c_int
+        x11.XTranslateCoordinates.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+                                             ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+                                             ctypes.POINTER(ctypes.c_int), c_ulongp]
+        x11.XMoveResizeWindow.restype   = ctypes.c_int
+        x11.XMoveResizeWindow.argtypes  = [ctypes.c_void_p, ctypes.c_ulong,
+                                          ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        x11.XRaiseWindow.argtypes       = [ctypes.c_void_p, ctypes.c_ulong]
+        x11.XFlush.argtypes             = [ctypes.c_void_p]
+        x11.XCloseDisplay.argtypes      = [ctypes.c_void_p]
+
+        class XRRCrtcInfo(ctypes.Structure):
+            # Layout per /usr/include/X11/extensions/Xrandr.h
+            _fields_ = [
+                ("timestamp",  ctypes.c_ulong),
+                ("x",          ctypes.c_int),
+                ("y",          ctypes.c_int),
+                ("width",      ctypes.c_uint),
+                ("height",     ctypes.c_uint),
+                ("mode",       ctypes.c_ulong),     # RRMode = XID
+                ("rotation",   ctypes.c_ushort),    # Rotation
+                ("noutput",    ctypes.c_int),
+                ("outputs",    ctypes.POINTER(ctypes.c_ulong)),
+                ("rotations",  ctypes.c_ushort),
+                ("npossible",  ctypes.c_int),
+                ("possible",   ctypes.POINTER(ctypes.c_ulong)),
+            ]
+
+        class XRRScreenResources(ctypes.Structure):
+            _fields_ = [
+                ("timestamp",      ctypes.c_ulong),
+                ("configTimestamp", ctypes.c_ulong),
+                ("ncrtc",          ctypes.c_int),
+                ("crtcs",          ctypes.POINTER(ctypes.c_ulong)),
+                ("noutput",        ctypes.c_int),
+                ("outputs",        ctypes.POINTER(ctypes.c_ulong)),
+                ("nmode",          ctypes.c_int),
+                ("modes",          ctypes.c_void_p),
+            ]
+
+        c_crtc_t  = ctypes.POINTER(XRRCrtcInfo)
+        c_res_t   = ctypes.POINTER(XRRScreenResources)
+        xrr.XRRGetScreenResources.restype = c_res_t
+        xrr.XRRGetScreenResources.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        xrr.XRRGetCrtcInfo.restype = c_crtc_t
+        xrr.XRRGetCrtcInfo.argtypes = [ctypes.c_void_p, c_res_t, ctypes.c_ulong]
+        xrr.XRRFreeCrtcInfo.argtypes = [c_crtc_t]
+        xrr.XRRFreeScreenResources.argtypes = [c_res_t]
+
+        dpy = x11.XOpenDisplay(None)
+        if not dpy:
+            print("cannot open X display -- using DPG fullscreen.")
+            self._is_fullscreen = not self._is_fullscreen
+            dpg.toggle_viewport_fullscreen()
+            return
+
+        title = APP_TITLE.encode()
+        root_win = x11.XDefaultRootWindow(dpy)
+        root  = ctypes.c_ulong()
+        parent = ctypes.c_ulong()
+        children = c_ulongp()
+        n_children = ctypes.c_int()
+        win = 0
+        if x11.XQueryTree(dpy, root_win,
+                          ctypes.byref(root), ctypes.byref(parent),
+                          ctypes.byref(children), ctypes.byref(n_children)):
+            try:
+                for i in range(n_children.value):
+                    w = children[i]
+                    nm = ctypes.c_char_p()
+                    if x11.XFetchName(dpy, w, ctypes.byref(nm)) and nm.value == title:
+                        win = w
+                        break
+                    if nm.value:
+                        x11.XFree(nm)
+                    # one level deeper for reparenting window managers
+                    inner = c_ulongp()
+                    n_inner = ctypes.c_int()
+                    if x11.XQueryTree(dpy, w, ctypes.byref(root), ctypes.byref(parent),
+                                      ctypes.byref(inner), ctypes.byref(n_inner)):
+                        try:
+                            for j in range(n_inner.value):
+                                nm2 = ctypes.c_char_p()
+                                if x11.XFetchName(dpy, inner[j], ctypes.byref(nm2)) \
+                                        and nm2.value == title:
+                                    win = inner[j]
+                                    break
+                                if nm2.value:
+                                    x11.XFree(nm2)
+                        finally:
+                            x11.XFree(inner)
+                    if win:
+                        break
+            finally:
+                x11.XFree(children)
+
+        if not win:
+            x11.XCloseDisplay(dpy)
+            print("DPG window not found in X tree -- using DPG fullscreen.")
+            self._is_fullscreen = not self._is_fullscreen
+            dpg.toggle_viewport_fullscreen()
+            return
+
+        # window geometry (size, and screen position relative to its parent)
+        rroot = ctypes.c_ulong()
+        gx = gy = gw = gh = cb = depth = ctypes.c_int()
+        x11.XGetGeometry(dpy, win, ctypes.byref(rroot),
+                         ctypes.byref(gx), ctypes.byref(gy),
+                         ctypes.byref(gw), ctypes.byref(gh),
+                         ctypes.byref(cb), ctypes.byref(depth))
+
+        # translate to true screen coordinates (parent is the WM frame on
+        # reparenting window managers, so XGetGeometry's x/y would be off)
+        sx = ctypes.c_int()
+        sy = ctypes.c_int()
+        cchild = ctypes.c_ulong()
+        if not x11.XTranslateCoordinates(dpy, win, root_win, 0, 0,
+                                         ctypes.byref(sx), ctypes.byref(sy),
+                                         ctypes.byref(cchild)):
+            sx, sy = gx, gy
+
+        # find the monitor containing the window centre via XRandR CRTCs
+        cx = int(sx.value) + int(gw.value) // 2
+        cy = int(sy.value) + int(gh.value) // 2
+        monitor = None
+        res = xrr.XRRGetScreenResources(dpy, win)
+        if res:
+            try:
+                for i in range(res.contents.ncrtc):
+                    info = xrr.XRRGetCrtcInfo(dpy, res, res.contents.crtcs[i])
+                    if not info:
+                        continue
+                    w_, h_ = info.contents.width, info.contents.height
+                    if w_ > 0 and info.contents.x <= cx < info.contents.x + w_ \
+                            and info.contents.y <= cy < info.contents.y + h_:
+                        monitor = (int(info.contents.x), int(info.contents.y),
+                                   int(w_), int(h_))
+                    xrr.XRRFreeCrtcInfo(info)
+                    if monitor:
+                        break
+            finally:
+                xrr.XRRFreeScreenResources(res)
+
+        if monitor is None:
+            x11.XCloseDisplay(dpy)
+            print("no XRandR monitor contains the window -- using DPG fullscreen.")
+            self._is_fullscreen = not self._is_fullscreen
+            dpg.toggle_viewport_fullscreen()
+            return
+
+        if not self._is_fullscreen:
+            self._x11_geom = (int(gx.value), int(gy.value),
+                              int(gw.value), int(gh.value))
+            x11.XMoveResizeWindow(dpy, win, *monitor)
+            x11.XRaiseWindow(dpy, win)
+            self._is_fullscreen = True
+        else:
+            x11.XMoveResizeWindow(dpy, win, *self._x11_geom)
+            x11.XRaiseWindow(dpy, win)
+            self._x11_geom = None
+            self._is_fullscreen = False
+
+        x11.XFlush(dpy)
+        x11.XCloseDisplay(dpy)
 
     def _on_escape_key(self, sender, app_data, user_data):
         """Exit fullscreen when Escape is pressed."""
