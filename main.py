@@ -27,7 +27,7 @@ else:
 
 # ── Application identity ────────────────────────────────────────────────────
 # Version string: bump the minor number with every released change.
-APP_VERSION = "7.12"                    # bump minor on each change
+APP_VERSION = "7.13"                    # bump minor on each change
 APP_TITLE   = f"Real-Time Oscilloscope V{APP_VERSION}"   # single definition used everywhere
 
 # ── Windows-only: monitor-aware borderless fullscreen via Win32 API ──────────
@@ -822,7 +822,14 @@ class AudioOscilloscopeDPG:
     def _x11_wayland_session():
         """True when the current session is Wayland, where X11 window
         manipulation is either unavailable or honoured by a WM that cannot
-        be directed (DPG falls back to its primary-monitor fullscreen)."""
+        be directed (DPG falls back to its primary-monitor fullscreen).
+
+        LIMITATION (Wayland): there is no monitor-aware fullscreen.  Wayland
+        forbids clients from moving/resizing windows by design, and DPG's
+        built-in toggle_viewport_fullscreen() always jumps to GLFW's PRIMARY
+        monitor -- the laptop LCD on a dual-monitor setup.  Fixing this would
+        require forking DPG/GLFW (or an XWayland-specific hack), so on
+        Wayland sessions the app is stuck on the primary monitor."""
         return (os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
                 or bool(os.environ.get("WAYLAND_DISPLAY")))
 
@@ -837,6 +844,10 @@ class AudioOscilloscopeDPG:
         cover exactly that monitor (and restores the saved geometry when
         toggled off).  Falls back to DPG's built-in fullscreen on Wayland
         sessions and when the X11 libraries are unavailable.
+
+        Wayland limitation: no client can position windows there (see
+        _x11_wayland_session), so on Wayland the window can only fill the
+        PRIMARY monitor, never a chosen one.
         """
         if self._x11_wayland_session():
             print("Wayland session detected -- using DPG fullscreen "
@@ -882,6 +893,11 @@ class AudioOscilloscopeDPG:
         x11.XRaiseWindow.argtypes       = [ctypes.c_void_p, ctypes.c_ulong]
         x11.XFlush.argtypes             = [ctypes.c_void_p]
         x11.XCloseDisplay.argtypes      = [ctypes.c_void_p]
+        x11.XInternAtom.restype         = ctypes.c_ulong
+        x11.XInternAtom.argtypes        = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        x11.XSendEvent.restype          = ctypes.c_int
+        x11.XSendEvent.argtypes         = [ctypes.c_void_p, ctypes.c_ulong,
+                                           ctypes.c_int, ctypes.c_long, ctypes.c_void_p]
 
         class XRRCrtcInfo(ctypes.Structure):
             # Layout per /usr/include/X11/extensions/Xrandr.h
@@ -920,6 +936,19 @@ class AudioOscilloscopeDPG:
         xrr.XRRGetCrtcInfo.argtypes = [ctypes.c_void_p, c_res_t, ctypes.c_ulong]
         xrr.XRRFreeCrtcInfo.argtypes = [c_crtc_t]
         xrr.XRRFreeScreenResources.argtypes = [c_res_t]
+
+        class XClientMessageEvent(ctypes.Structure):
+            # Layout per <X11/Xlib.h> (XEvent union member) -- do not alter.
+            _fields_ = [
+                ("type",         ctypes.c_int),
+                ("serial",       ctypes.c_ulong),
+                ("send_event",   ctypes.c_int),
+                ("display",      ctypes.c_void_p),
+                ("window",       ctypes.c_ulong),
+                ("message_type", ctypes.c_ulong),
+                ("format",       ctypes.c_int),
+                ("data",         ctypes.c_long * 5),
+            ]
 
         dpy = x11.XOpenDisplay(None)
         if not dpy:
@@ -975,6 +1004,28 @@ class AudioOscilloscopeDPG:
             dpg.toggle_viewport_fullscreen()
             return
 
+        # Reparenting WMs (GNOME/Mutter, KDE, XFCE...) wrap the client in a
+        # decorated FRAME window that inherits the title, so the top-level
+        # match above is normally the frame.  XMoveResizeWindow on a frame is
+        # ignored by the WM -- descend one level to the child sharing the
+        # title, which is the real client window.  Non-reparenting WMs leave
+        # this as win (no child carries the title).
+        client = win
+        if x11.XQueryTree(dpy, win, ctypes.byref(root), ctypes.byref(parent),
+                          ctypes.byref(children), ctypes.byref(n_children)):
+            try:
+                for i in range(n_children.value):
+                    nm3 = ctypes.c_char_p()
+                    if x11.XFetchName(dpy, children[i], ctypes.byref(nm3)) \
+                            and nm3.value == title:
+                        client = children[i]
+                        break
+                    if nm3.value:
+                        x11.XFree(nm3)
+            finally:
+                x11.XFree(children)
+        win = client
+
         # window geometry (size, and screen position relative to its parent)
         rroot = ctypes.c_ulong()
         gx = gy = gw = gh = cb = depth = ctypes.c_int()
@@ -1022,15 +1073,41 @@ class AudioOscilloscopeDPG:
             dpg.toggle_viewport_fullscreen()
             return
 
+        # EWMH: a monitor-covering window may be inferred as
+        # _NET_WM_STATE_FULLSCREEN by the WM, which makes it ignore later
+        # XMoveResizeWindow requests while that state is active.
+        _NET_WM_STATE      = x11.XInternAtom(dpy, b"_NET_WM_STATE", 0)
+        _NET_WM_STATE_FS    = x11.XInternAtom(dpy, b"_NET_WM_STATE_FULLSCREEN", 0)
+
         if not self._is_fullscreen:
-            self._x11_geom = (int(gx.value), int(gy.value),
-                              int(gw.value), int(gh.value))
+            _vp_pos = dpg.get_viewport_pos()
+            self._x11_geom = (int(_vp_pos[0]), int(_vp_pos[1]),
+                              dpg.get_viewport_width(),
+                              dpg.get_viewport_height())
             x11.XMoveResizeWindow(dpy, win, *monitor)
             x11.XRaiseWindow(dpy, win)
             self._is_fullscreen = True
         else:
-            x11.XMoveResizeWindow(dpy, win, *self._x11_geom)
-            x11.XRaiseWindow(dpy, win)
+            # Clear any EWMH fullscreen state the WM inferred so it honours
+            # the restore request (verified on GNOME/Mutter).
+            _fs = XClientMessageEvent()
+            _fs.type = 33  # ClientMessage
+            _fs.window = win
+            _fs.message_type = _NET_WM_STATE
+            _fs.format = 32
+            _fs.data[0] = 0  # _NET_WM_STATE_REMOVE
+            _fs.data[1] = _NET_WM_STATE_FS
+            x11.XSendEvent(dpy, root_win, 0, 0xFFFFFF, ctypes.byref(_fs))
+            x11.XFlush(dpy)
+            # Restore via DPG's own viewport setters: GLFW re-issues the
+            # window size/position from the client side, which the WM always
+            # honours, and keeps its internal size state consistent (raw
+            # XMoveResizeWindow here left the window at a tiny size on
+            # GNOME/Mutter).
+            _gx, _gy, _gw, _gh = self._x11_geom
+            dpg.set_viewport_pos([float(_gx), float(_gy)])
+            dpg.set_viewport_width(_gw)
+            dpg.set_viewport_height(_gh)
             self._x11_geom = None
             self._is_fullscreen = False
 
